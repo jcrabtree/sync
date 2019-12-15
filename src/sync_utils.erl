@@ -1,7 +1,9 @@
+%% vim: ts=4 sw=4 et
 -module(sync_utils).
 -export([
          get_src_dir_from_module/1,
          get_options_from_module/1,
+         get_filetype/1,
          get_src_dir/1,
          wildcard/2,
          get_env/2,
@@ -11,6 +13,16 @@
          get_system_modules/0
 ]).
 
+-ifdef(OTP_RELEASE). %% this implies 21 or higher
+-define(EXCEPTION(Class, Reason, Stacktrace), Class:Reason:Stacktrace).
+-define(GET_STACK(Stacktrace), Stacktrace).
+-else.
+-define(EXCEPTION(Class, Reason, _), Class:Reason).
+-define(GET_STACK(_), erlang:get_stacktrace()).
+-endif.
+
+-compile([export_all, nowarn_export_all]).
+
 get_src_dir_from_module(Module)->
     case code:is_loaded(Module) of
         {file, _} ->
@@ -19,16 +31,42 @@ get_src_dir_from_module(Module)->
                 Props = Module:module_info(compile),
                 Source = proplists:get_value(source, Props, ""),
 
-                %% Ensure that the file exists...
-                filelib:is_regular(Source) orelse
-                    throw(not_found),
+                %% Ensure that the file exists, is a decendent of the tree, and
+                %% how to deal with that
 
-                %% Get the source dir...
-                Dir = filename:dirname(Source),
-                get_src_dir(Dir)
-            catch _ : _ ->
-                    undefined
-            end;
+                IsFile = filelib:is_regular(Source),
+                IsDecendant = is_path_decendent(Source),
+                NonDecendants = get_env(non_descendants, fix),
+                Source2 = case {IsFile, IsDecendant, NonDecendants} of
+                    %% is file and descendant, we're good to go
+                    {true, true,  _}    -> Source;
+
+                    %% is not a descendant, but we allow them, so good to go
+                    {true, false, allow}-> Source;
+
+                    %% is not a file, but is a descendant, file is deleted,
+                    %% nothing we can do
+                    {false,true,  _}    -> undefined;
+
+                    %% is not a descendant, and we fix non-descendants, so let's
+                    %% fix it
+                    {_,    false, fix}  -> find_descendant_module(Source, IsFile);
+
+                    %% Anything else, and we don't know what to do, so let's
+                    %% just bail.
+                    _                   -> undefined
+                end,
+
+                case Source2 of
+                    undefined -> undefined;
+                    _ ->
+                        %% Get the source dir...
+                        Dir = filename:dirname(Source2),
+                        get_src_dir(Dir)
+                end
+           catch _ : _ ->
+                   undefined
+           end;
         _ ->
             undefined
     end.
@@ -37,49 +75,200 @@ get_options_from_module(Module) ->
     case code:is_loaded(Module) of
         {file, _} ->
             try
+
                 Props = Module:module_info(compile),
-                {ok, proplists:get_value(options, Props, [])}
-            catch _ : _ ->
-                    undefined
+                BeamDir = filename:dirname(code:which(Module)),
+
+                Options1 = proplists:get_value(options, Props, []),
+
+                %% transform `outdir'
+                Options2 = transform_outdir(BeamDir, Options1),
+
+                Options3 = ensure_has_include(Options2),
+
+                %% transform the include directories
+                Options4 = transform_all_includes(Module, BeamDir, Options3),
+
+                %% maybe_add_compile_info
+                Options5 = maybe_add_compile_info(Options4),
+
+                %% add filetype to options (DTL, LFE, erl, etc)
+                Options6 = add_filetype(Module, Options5),
+
+                {ok, Options6}
+            catch ?EXCEPTION(ExType, Error, Stacktrace) ->
+                Msg =
+                    [
+                        io_lib:format(
+                            "~p:0: ~p looking for options: ~p. Stack: ~p~n",
+                            [Module, ExType, Error, ?GET_STACK(Stacktrace)])
+                    ],
+                sync_notify:log_warnings(Msg),
+                {ok, []}
             end;
         _ ->
             {ok, []}
     end.
 
+transform_outdir(BeamDir, Options) ->
+    [{outdir, BeamDir} | proplists:delete(outdir, Options)].
 
-%% @private Find the src directory for the specified Directory
-get_src_dir(Dir) ->
-    Mode = get_env(sync_mode,normal),
-    get_src_dir(Mode,Dir).
+ensure_has_include(Options) ->
+    case proplists:get_value(i, Options) of
+        undefined -> [{i, "include"} | Options];
+        _ -> Options
+    end.
 
-get_src_dir(_,Dir) when Dir == ""; Dir == "/"; Dir == "." ->
+transform_all_includes(Module, BeamDir, Options) ->
+    [transform_include(Module, BeamDir, Opt) || Opt <- Options].
+
+transform_include(Module, BeamDir, {i, IncludeDir}) ->
+    {ok, SrcDir} = get_src_dir_from_module(Module),
+    {ok, IncludeDir2} = determine_include_dir(IncludeDir, BeamDir, SrcDir),
+    {i, IncludeDir2};
+transform_include(_, _, Other) ->
+    Other.
+
+maybe_add_compile_info(Options) ->
+    case lists:member(predetermined, Options) of
+        true -> Options;
+        false -> add_compile_info(Options)
+    end.
+
+add_compile_info(Options) ->
+    CompInfo = [{K,V} || {K,V} <- Options, lists:member(K, [outdir, i])],
+    [{compile_info, CompInfo} | Options].
+
+add_filetype(Module, Options) ->
+    Type = get_filetype(Module),
+    [{type, Type} | Options].
+
+%% @private This will check if the given module or source file is an ErlyDTL template.
+%% Currently, this is done by checking if its reported source path ends with
+%% ".dtl.erl".
+get_filetype(Module) when is_atom(Module) ->
+    Props = Module:module_info(compile),
+    Source = proplists:get_value(source, Props, ""),
+    get_filetype(Source);
+
+get_filetype(Source) when is_list(Source) ->
+    Ext = filename:extension(Source),
+    Root = filename:rootname(Source),
+    SecondExt = filename:extension(Root),
+    case Ext of
+        ".erl" when SecondExt =:= ".dtl" -> dtl;
+        ".dtl" -> dtl;
+        ".erl" -> erl;
+        ".lfe" -> lfe;
+        ".ex" -> elixir
+    end.
+
+%% @private This will search back to find an appropriate include directory, by
+%% searching further back than "..". Instead, it will extract the basename
+%% (probably "include" from the include pathfile, and then search backwards in
+%% the directory tree until it finds a directory with the same basename found
+%% above.
+determine_include_dir(IncludeDir, BeamDir, SrcDir) ->
+    IncludeBase = filename:basename(IncludeDir),
+    case determine_include_dir_from_beam_dir(IncludeBase, BeamDir) of
+        {ok, D} -> {ok, D};
+        undefined ->
+            {ok, Cwd} = file:get_cwd(),
+            Cwd2 = normalize_case_windows_dir(Cwd),
+            SrcDir2 = normalize_case_windows_dir(SrcDir),
+            IncludeBase2 = normalize_case_windows_dir(IncludeBase),
+            case find_include_dir_from_ancestors(Cwd2, IncludeBase2, SrcDir2) of
+                {ok, D} -> {ok, D};
+                undefined -> {ok, IncludeDir} %% Failed, just stick with original
+            end
+    end.
+
+%% @private First try to see if we have an include file alongside our ebin
+%directory, which is typically the case
+determine_include_dir_from_beam_dir(IncludeBase, BeamDir) ->
+    BeamBasedIncDir = filename:join(filename:dirname(BeamDir),IncludeBase),
+    case filelib:is_dir(BeamBasedIncDir) of
+        true -> {ok, BeamBasedIncDir};
+        false -> undefined
+    end.
+
+%% @private Then we dig back through the parent directories until we find our
+%include directory
+find_include_dir_from_ancestors(Cwd, _, Cwd) -> undefined;
+find_include_dir_from_ancestors(_, _, "/") -> undefined;
+find_include_dir_from_ancestors(_, _, ".") -> undefined;
+find_include_dir_from_ancestors(_, _, "") -> undefined;
+find_include_dir_from_ancestors(Cwd, IncludeBase, Dir) ->
+    AttemptDir = filename:join(filename:dirname(Dir),IncludeBase),
+    case filelib:is_dir(AttemptDir) of
+        true ->
+            {ok, AttemptDir};
+        false ->
+            find_include_dir_from_ancestors(Cwd, IncludeBase, filename:dirname(Dir))
+    end.
+
+normalize_case_windows_dir(Dir) ->
+    case os:type() of
+        {win32,_} -> string:to_lower(Dir);
+        {unix,_} -> Dir
+    end.
+
+
+%% @private This is an attempt to intelligently fix paths in modules when a
+%% release is moved.  Essentially, it takes a module name and its original path
+%% from Module:module_info(compile), say
+%% "/some/original/path/site/src/pages/somepage.erl", and then breaks down the
+%% path one by one prefixing it with the current working directory until it
+%% either finds a match, or fails.  If it succeeds, it returns the Path to the
+%% new Source file.
+find_descendant_module([], _IsFile) ->
     undefined;
- 
-%% @private Find's the src directory for the directory using the normal method or the original method which is compatible with Nitrogen
-%% Will drop back in the directory tree until it finds either a src, ebin, or include directory and return the parent directory with "src" appended
-get_src_dir(nitrogen,Dir) ->
-    IsCodeDir = filelib:is_dir(filename:join(Dir, "src")) 
-        orelse filelib:is_dir(filename:join(Dir, "ebin")) 
-        orelse filelib:is_dir(filename:join(Dir, "include")),
+find_descendant_module(Path, IsFile) ->
+    PathParts = filename:split(Path),
+    {ok, Cwd} = file:get_cwd(),
+    case find_descendant_module_worker(Cwd, PathParts) of
+        undefined -> use_original_file_if_exists(Path, IsFile);
+        FoundPath -> FoundPath
+    end.
 
-    if
-        IsCodeDir -> 
-            {ok, filename:join(Dir, "src")};
-        true -> get_src_dir(nitrogen,filename:dirname(Dir))
-    end;
+use_original_file_if_exists(Path, IsFile) ->
+    case IsFile of
+        true -> Path;
+        false -> undefined
+    end.
 
-%% Normal method is smarter and returns exactly any path that has .erl or .hrl files in it
-%% With Nitrogen, or any structure in which -include("something.hrl") specifies an implied directory, this will give "unable to find include file" errors
-get_src_dir(normal,Dir) ->
+find_descendant_module_worker(_Cwd, []) ->
+    undefined;
+find_descendant_module_worker(Cwd, [_|T]) ->
+    PathAttempt = filename:join([Cwd|T]),
+    case filelib:is_regular(PathAttempt) of
+        true -> PathAttempt;
+        false -> find_descendant_module_worker(Cwd, T)
+    end.
+
+%% @private returns true if the provided path is a descendant of the current
+%% working directory.
+is_path_decendent(Path) ->
+    {ok, Cwd} = file:get_cwd(),
+    lists:sublist(Path, length(Cwd)) == Cwd.
+
+%% @private Find the src directory for the specified Directory; max 15 iterations
+get_src_dir(Dir) ->
+    get_src_dir(Dir, 15).
+
+get_src_dir(_Dir, 0) ->
+    undefined;
+get_src_dir(Dir, Ctr) ->
     HasCode =
         filelib:wildcard("*.erl", Dir) /= [] orelse
-        filelib:wildcard("*.hrl", Dir) /= [],
-        if
-            HasCode -> {ok,Dir};
-            true -> get_src_dir(filename:dirname(Dir))
-        end;
-get_src_dir(OtherMode,_Dir) ->
-    throw({unknown_mode,OtherMode}).
+        filelib:wildcard("*.dtl", Dir) /= [] orelse
+        filelib:wildcard("*.hrl", Dir) /= [] orelse
+        filelib:wildcard("*.lfe", Dir) /= [] orelse
+        filelib:wildcard("*.ex", Dir) /= [],
+    if
+        HasCode -> {ok,Dir};
+        true -> get_src_dir(filename:dirname(Dir), Ctr - 1)
+    end.
 
 %% @private Return all files in a directory matching a regex.
 wildcard(Dir, Regex) ->
@@ -87,7 +276,7 @@ wildcard(Dir, Regex) ->
 
 %% @private Get an environment variable.
 get_env(Var, Default) ->
-    case application:get_env(Var) of
+    case application:get_env(sync, Var) of
         {ok, Value} ->
             Value;
         _ ->
@@ -121,11 +310,9 @@ transform_options(SrcDir, Options) ->
         end
     end,
 
-    LastPart = hd(lists:reverse(filename:split(proplists:get_value(outdir, Options, "./ebin")))),
+    LastPart = filename:basename(proplists:get_value(outdir, Options, "./ebin")),
     BinDir = filename:join([SrcDir, "..", LastPart]),
     lists:foldl(F, [], Options) ++ [{outdir, BinDir}].
-
-
 
 %% @private Return a list of all modules that belong to Erlang rather
 %% than whatever application we may be running.
